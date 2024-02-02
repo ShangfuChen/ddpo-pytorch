@@ -1,1 +1,5 @@
 /wandb
+/config/__pycache__
+/ddpo_pytorch/__pycache__
+/ddpo_pytorch/diffusers_patch/__pycache__
+*.pyc
