@@ -4,6 +4,16 @@ import numpy as np
 import torch
 
 
+def red_score():
+    def _fn(images, prompts, metadata):
+        if isinstance(images, torch.Tensor):
+            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+            images = images[:, 0, :, :]
+            score = np.array([np.mean(images)])
+        return score, {}
+    return _fn
+
+
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):
         if isinstance(images, torch.Tensor):

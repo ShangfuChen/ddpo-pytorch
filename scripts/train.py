@@ -392,7 +392,7 @@ def main(_):
                 pil = Image.fromarray(
                     (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
-                pil = pil.resize((256, 256))
+                # pil = pil.resize((256, 256))
                 pil.save(os.path.join(tmpdir, f"{i}.jpg"))
             accelerator.log(
                 {

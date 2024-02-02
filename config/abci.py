@@ -91,7 +91,8 @@ def get_config():
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
-    config.prompt_fn = "simple_animals"
+    # config.prompt_fn = "simple_animals"
+    config.prompt_fn = "cute_cats"
     # kwargs to pass to the prompt function.
     config.prompt_fn_kwargs = {}
 
