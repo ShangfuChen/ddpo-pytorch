@@ -1,4 +1,5 @@
 /wandb
+/logs
 /config/__pycache__
 /ddpo_pytorch/__pycache__
 /ddpo_pytorch/diffusers_patch/__pycache__

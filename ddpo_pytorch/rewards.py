@@ -9,7 +9,7 @@ def red_score():
         if isinstance(images, torch.Tensor):
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
             images = images[:, 0, :, :]
-            score = np.array([np.mean(images)])
+            score = np.mean(images, axis=(1, 2))
         return score, {}
     return _fn
 
