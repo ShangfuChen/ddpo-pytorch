@@ -30,6 +30,7 @@ tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 
 FLAGS = flags.FLAGS
+NUM_ITER = 5
 config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
 
 logger = get_logger(__name__)
@@ -75,7 +76,7 @@ def main(_):
         # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
         # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
         # the total number of optimizer steps to accumulate across.
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps*5)
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps*NUM_ITER)
     if accelerator.is_main_process:
         accelerator.init_trackers(
             project_name="ddpo-pytorch",
@@ -434,7 +435,8 @@ def main(_):
                 for k, v in samples.items()
             }
             rewards = samples_batched["rewards"].reshape(-1)
-            weights = torch.softmax(-rewards/255, 0)
+            weights = torch.softmax(rewards/255, 0)
+            # weights = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
             # dict of lists -> list of dicts for easier iteration
             samples_batched = [
                 dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
@@ -459,7 +461,7 @@ def main(_):
                 
                 mini_bs = config.train.batch_size
                 for j in tqdm(
-                    range(5),
+                    range(NUM_ITER),
                     desc="Iterations",
                     position=1,
                     leave=False,
@@ -468,6 +470,7 @@ def main(_):
                     with accelerator.accumulate(unet):
                         with autocast():
                             latents = sample["latents"]
+                            latents = latents * 0.18215
                             noise = torch.rand(latents.shape).to(accelerator.device)
                             timesteps = torch.randint(
                                             low=0,
@@ -501,8 +504,6 @@ def main(_):
                                     embeds,
                                 ).sample
                         loss = ((noise - noise_pred) ** 2).mean(dim=(1, 2, 3))
-                        rewards = sample["rewards"]/255
-                        # weights = torch.softmaxwrewards, 0)
                         w = weights[i*mini_bs: (i+1)*mini_bs]
                         loss = (loss * w).sum()
                         loss = loss.sum()

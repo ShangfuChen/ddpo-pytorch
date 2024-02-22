@@ -210,14 +210,12 @@ def pipeline_with_logprob(
                 noise_pred = rescale_noise_cfg(
                     noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
                 )
-
             # compute the previous noisy sample x_t -> x_t-1
-            # latents, log_prob = dpm_step_with_logprob(
+            # latents = (S_bs, 4, 64, 64)
+            # t = 1
             latents, log_prob = dpm_step_with_logprob(
                 self.scheduler, noise_pred, t, latents,
             )
-            # import ipdb
-            # ipdb.set_trace()
 
             all_latents.append(latents)
             all_log_probs.append(log_prob)

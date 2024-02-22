@@ -498,8 +498,6 @@ def main(_):
                 else:
                     embeds = sample["prompt_embeds"]
                 
-                # import ipdb
-                # ipdb.set_trace()
                 for j in tqdm(
                     range(num_train_timesteps),
                     desc="Timestep",
@@ -528,6 +526,8 @@ def main(_):
                                     embeds,
                                 ).sample
                             # compute the log prob of next_latents given latents under the current model
+                            # sample["latent"][:, j] (B, 4, 64, 64)
+                            # sample["timesteps"][:, j] (B)
                             _, log_prob = ddim_step_with_logprob(
                                 pipeline.scheduler,
                                 noise_pred,
@@ -544,6 +544,7 @@ def main(_):
                             config.train.adv_clip_max,
                         )
                         ratio = torch.exp(log_prob - sample["log_probs"][:, j])
+                        info["ratio"].append(ratio)
                         unclipped_loss = -advantages * ratio
                         clipped_loss = -advantages * torch.clamp(
                             ratio,

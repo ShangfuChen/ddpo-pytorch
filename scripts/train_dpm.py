@@ -4,7 +4,6 @@ import os
 import datetime
 from concurrent import futures
 import time
-import random
 from absl import app, flags
 from ml_collections import config_flags
 from accelerate import Accelerator
@@ -18,8 +17,8 @@ import numpy as np
 import ddpo_pytorch.prompts
 import ddpo_pytorch.rewards
 from ddpo_pytorch.stat_tracking import PerPromptStatTracker
-# from ddpo_pytorch.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
 from ddpo_pytorch.diffusers_patch.pipeline_dpm_with_logprob import pipeline_with_logprob
+from ddpo_pytorch.diffusers_patch.dpm_with_logprob import dpm_step_with_logprob
 import torch
 import wandb
 from functools import partial
@@ -31,7 +30,6 @@ tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 
 FLAGS = flags.FLAGS
-NUM_ITER = 1
 config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
 
 logger = get_logger(__name__)
@@ -77,7 +75,9 @@ def main(_):
         # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
         # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
         # the total number of optimizer steps to accumulate across.
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps*NUM_ITER)
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps
+        * num_train_timesteps,
+    )
     if accelerator.is_main_process:
         accelerator.init_trackers(
             project_name="ddpo-pytorch",
@@ -346,8 +346,11 @@ def main(_):
                     output_type="pt",
                 )
             # (batch_size, num_steps + 1, 4, 64, 64)
-            latents = latents[-1]
-            # shape of images (sampling_batch, 3, 512, 512) tensor
+            latents = torch.stack(
+                latents, dim=1
+            )  # (batch_size, num_steps + 1, 4, 64, 64)
+            log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
+            log_probs = log_probs.to(accelerator.device)
             timesteps = pipeline.scheduler.timesteps.repeat(
                 config.sample.batch_size, 1
             )  # (batch_size, num_steps)
@@ -361,7 +364,13 @@ def main(_):
                     "prompt_ids": prompt_ids,
                     "prompt_embeds": prompt_embeds,
                     "timesteps": timesteps,
-                    "latents": latents,
+                    "latents": latents[
+                        :, :-1
+                    ],  # each entry is the latent before timestep t
+                    "next_latents": latents[
+                        :, 1:
+                    ],  # each entry is the latent after timestep t
+                    "log_probs": log_probs,
                     "rewards": rewards,
                 }
             )
@@ -417,6 +426,25 @@ def main(_):
             step=global_step,
         )
 
+        # per-prompt mean/std tracking
+        if config.per_prompt_stat_tracking:
+            # gather the prompts across processes
+            prompt_ids = accelerator.gather(samples["prompt_ids"]).cpu().numpy()
+            prompts = pipeline.tokenizer.batch_decode(
+                prompt_ids, skip_special_tokens=True
+            )
+            advantages = stat_tracker.update(prompts, rewards)
+        else:
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+        # ungather advantages; we only need to keep the entries corresponding to the samples on this process
+        samples["advantages"] = (
+            torch.as_tensor(advantages)
+            .reshape(accelerator.num_processes, -1)[accelerator.process_index]
+            .to(accelerator.device)
+        )
+
+        del samples["rewards"]
         del samples["prompt_ids"]
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
@@ -426,27 +454,38 @@ def main(_):
         )
         assert num_timesteps == config.sample.num_steps
 
-
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=accelerator.device)
             samples = {k: v[perm] for k, v in samples.items()}
-            # # rebatch for training
+
+            # shuffle along time dimension independently for each sample
+            perms = torch.stack(
+                [
+                    torch.randperm(num_timesteps, device=accelerator.device)
+                    for _ in range(total_batch_size)
+                ]
+            )
+            for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+                samples[key] = samples[key][
+                    torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                    perms,
+                ]
+
+            # rebatch for training
             samples_batched = {
                 k: v.reshape(-1, config.train.batch_size, *v.shape[1:])
                 for k, v in samples.items()
             }
-            rewards = samples_batched["rewards"].reshape(-1)
-            # weights = torch.softmax(rewards/255, 0)
-            weights = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
             # dict of lists -> list of dicts for easier iteration
             samples_batched = [
                 dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
             ]
+
             # train
             pipeline.unet.train()
-            scheduler = pipeline.scheduler
             info = defaultdict(list)
             for i, sample in tqdm(
                 list(enumerate(samples_batched)),
@@ -462,36 +501,19 @@ def main(_):
                 else:
                     embeds = sample["prompt_embeds"]
                 
-                mini_bs = config.train.batch_size
                 for j in tqdm(
-                    range(NUM_ITER),
-                    desc="Iterations",
+                    range(num_train_timesteps),
+                    desc="Timestep",
                     position=1,
                     leave=False,
                     disable=not accelerator.is_local_main_process,
                 ):
                     with accelerator.accumulate(unet):
                         with autocast():
-                            latents = sample["latents"]
-                            latents = latents * 0.18215
-                            noise = torch.rand(latents.shape).to(accelerator.device)
-                            timesteps = torch.randint(
-                                            low=0,
-                                            high=scheduler.config.num_train_timesteps,
-                                            size=(latents.shape[0],),
-                                        ).to(accelerator.device)
-                            noisy_latents = scheduler.add_noise(
-                                latents,
-                                noise,
-                                timesteps
-                            )
                             if config.train.cfg:
-                                # latents shape: (B, 4, 64, 64)
-                                # timesteps: (B,)
-                                # embeds: (4, 77, 768)
                                 noise_pred = unet(
-                                    torch.cat([noisy_latents] * 2),
-                                    torch.cat([timesteps] * 2),
+                                    torch.cat([sample["latents"][:, j]] * 2),
+                                    torch.cat([sample["timesteps"][:, j]] * 2),
                                     embeds,
                                 ).sample
                                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -502,16 +524,53 @@ def main(_):
                                 )
                             else:
                                 noise_pred = unet(
-                                    noisy_latents,
-                                    timesteps,
+                                    sample["latents"][:, j],
+                                    sample["timesteps"][:, j],
                                     embeds,
                                 ).sample
-                        loss = ((noise - noise_pred) ** 2).mean(dim=(1, 2, 3))
-                        # rewards = sample["rewards"]/255
-                        # weights = torch.softmaxw(rewards, 0)
-                        w = weights[i*mini_bs: (i+1)*mini_bs]
-                        loss = (loss * w).sum()
-                        loss = loss.sum()
+                            # compute the log prob of next_latents given latents under the current model
+                            import ipdb
+                            ipdb.set_trace()
+                            _, log_prob = dpm_step_with_logprob(
+                                pipeline.scheduler,
+                                noise_pred,
+                                sample["timesteps"][:, j],
+                                sample["latents"][:, j],
+                            )
+                            ### TODO ###
+                            # Hack
+                            log_prob = log_prob.to(accelerator.device)
+
+                        # ppo logic
+                        advantages = torch.clamp(
+                            sample["advantages"],
+                            -config.train.adv_clip_max,
+                            config.train.adv_clip_max,
+                        )
+                        ratio = torch.exp(log_prob - sample["log_probs"][:, j])
+                        unclipped_loss = -advantages * ratio
+                        clipped_loss = -advantages * torch.clamp(
+                            ratio,
+                            1.0 - config.train.clip_range,
+                            1.0 + config.train.clip_range,
+                        )
+                        loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+
+                        # debugging values
+                        # John Schulman says that (ratio - 1) - log(ratio) is a better
+                        # estimator, but most existing code uses this so...
+                        # http://joschu.net/blog/kl-approx.html
+                        info["approx_kl"].append(
+                            0.5
+                            * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
+                        )
+                        info["clipfrac"].append(
+                            torch.mean(
+                                (
+                                    torch.abs(ratio - 1.0) > config.train.clip_range
+                                ).float()
+                            )
+                        )
                         info["loss"].append(loss)
 
                         # backward pass
@@ -524,15 +583,18 @@ def main(_):
                         optimizer.zero_grad()
 
                     # Checks if the accelerator has performed an optimization step behind the scenes
-                if accelerator.sync_gradients:
-                    assert (i + 1) % config.train.gradient_accumulation_steps == 0
-                    # log training-related stuff
-                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                    info = accelerator.reduce(info, reduction="mean")
-                    info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                    accelerator.log(info, step=global_step)
-                    global_step += 1
-                    info = defaultdict(list)
+                    if accelerator.sync_gradients:
+                        assert (j == num_train_timesteps - 1) and (
+                            i + 1
+                        ) % config.train.gradient_accumulation_steps == 0
+                        # log training-related stuff
+                        info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                        info = accelerator.reduce(info, reduction="mean")
+                        info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                        accelerator.log(info, step=global_step)
+                        global_step += 1
+                        info = defaultdict(list)
+
             # make sure we did an optimization step at the end of the inner epoch
             assert accelerator.sync_gradients
 
